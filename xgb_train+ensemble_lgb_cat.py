@@ -1,0 +1,120 @@
+import pandas as pd, numpy as np
+from sklearn.metrics import r2_score
+import xgboost as xgb
+import warnings; warnings.filterwarnings('ignore')
+
+train = pd.read_csv('/mnt/user-data/uploads/train.csv')
+test = pd.read_csv('/mnt/user-data/uploads/test.csv')
+
+def parse_ts(ts):
+    h,m=ts.split(':'); return int(h)*60+int(m)
+def decode_geohash(gh):
+    gh_map={c:i for i,c in enumerate('0123456789bcdefghjkmnpqrstuvwxyz')}
+    lr,mr=[-90.,90.],[-180.,180.]; il=True
+    for c in str(gh):
+        b=gh_map.get(c,0)
+        for i in range(4,-1,-1):
+            bit=(b>>i)&1
+            if il:
+                mid=sum(mr)/2;(mr.__setitem__(0,mid) if bit else mr.__setitem__(1,mid))
+            else:
+                mid=sum(lr)/2;(lr.__setitem__(0,mid) if bit else lr.__setitem__(1,mid))
+            il=not il
+    return sum(lr)/2,sum(mr)/2
+
+for df in [train,test]:
+    df['ts_min']=df['timestamp'].apply(parse_ts); df['hour']=df['ts_min']//60
+
+d48=train[train['day']==48].copy(); d49=train[train['day']==49].copy()
+all_geo=pd.concat([train['geohash'],test['geohash']]).unique()
+cdf=pd.DataFrame({'geohash':all_geo}); cdf[['lat','lon']]=cdf['geohash'].apply(lambda g:pd.Series(decode_geohash(g)))
+gt=d48.groupby(['geohash','ts_min'])['demand'].agg(['sum','count','mean']).reset_index(); gt.columns=['geohash','ts_min','ts_sum','ts_count','geo_ts_mean']
+gh=d48.groupby(['geohash','hour'])['demand'].mean().reset_index(); gh.columns=['geohash','hour','geo_hour_mean']
+gs=d48.groupby('geohash')['demand'].agg(geo_mean='mean',geo_std='std',geo_max='max',geo_min='min').reset_index().fillna({'geo_std':0})
+hg=d48.groupby('hour')['demand'].agg(['mean','std']).reset_index(); hg.columns=['hour','hour_mean','hour_std']
+tg=d48.groupby('ts_min')['demand'].mean().reset_index(); tg.columns=['ts_min','ts_mean']
+rt=d48.groupby(['RoadType','ts_min'])['demand'].mean().reset_index(); rt.columns=['RoadType','ts_min','road_ts_mean']
+rh=d48.groupby(['RoadType','hour'])['demand'].mean().reset_index(); rh.columns=['RoadType','hour','road_hour_mean']
+d48['g4']=d48['geohash'].str[:4]
+p4t=d48.groupby(['g4','ts_min'])['demand'].mean().reset_index(); p4t.columns=['g4','ts_min','p4_ts_mean']
+p4h=d48.groupby(['g4','hour'])['demand'].mean().reset_index(); p4h.columns=['g4','hour','p4_hour_mean']
+p4m=d48.groupby('g4')['demand'].mean().reset_index(); p4m.columns=['g4','p4_mean']
+gm=d48['demand'].mean(); mt=d48['Temperature'].median()
+
+def featurize(df,loo=False):
+    df=df.copy()
+    for c in ['RoadType','Weather']: df[c]=df[c].fillna('Unknown')
+    df['re']=df['RoadType'].map({'Residential':0,'Street':1,'Highway':2,'Unknown':-1}).fillna(-1)
+    df['we']=df['Weather'].map({'Sunny':0,'Rainy':1,'Foggy':2,'Snowy':3,'Unknown':-1}).fillna(-1)
+    df['lv']=(df['LargeVehicles']=='Allowed').astype(int)
+    df['lm']=(df['Landmarks']=='Yes').astype(int)
+    df['Temperature']=df['Temperature'].fillna(mt)
+    df['tss']=np.sin(2*np.pi*df['ts_min']/(24*60)); df['tsc']=np.cos(2*np.pi*df['ts_min']/(24*60))
+    df['hs']=np.sin(2*np.pi*df['hour']/24); df['hc']=np.cos(2*np.pi*df['hour']/24)
+    df['td']=df['Temperature']-mt; df['g4']=df['geohash'].str[:4]
+    df=df.merge(cdf,on='geohash',how='left').merge(gs,on='geohash',how='left')
+    df=df.merge(gt[['geohash','ts_min','geo_ts_mean']],on=['geohash','ts_min'],how='left')
+    df=df.merge(gh,on=['geohash','hour'],how='left').merge(hg,on='hour',how='left')
+    df=df.merge(tg,on='ts_min',how='left').merge(rt,on=['RoadType','ts_min'],how='left')
+    df=df.merge(rh,on=['RoadType','hour'],how='left').merge(p4t,on=['g4','ts_min'],how='left')
+    df=df.merge(p4h,on=['g4','hour'],how='left').merge(p4m,on='g4',how='left')
+    for off in [15,-15,30,-30,60,-60,120,-120]:
+        tmp=gt[['geohash','ts_min','geo_ts_mean']].copy(); tmp['ts_min']=tmp['ts_min']-off
+        tmp.columns=['geohash','ts_min',f'gl{off:+d}']; df=df.merge(tmp,on=['geohash','ts_min'],how='left')
+    if loo and 'demand' in df.columns:
+        tmp2=df[['geohash','ts_min','demand']].merge(gt,on=['geohash','ts_min'],how='left')
+        df['geo_ts_mean']=((tmp2['ts_sum']-tmp2['demand'])/(tmp2['ts_count']-1).clip(lower=1)).values
+    df['gtr']=df['geo_ts_mean']/(df['ts_mean']+1e-8); df['ghr']=df['geo_hour_mean']/(df['hour_mean']+1e-8)
+    df['gdr']=df['geo_mean']/(gm+1e-8); df['rvh']=df['road_hour_mean']/(df['hour_mean']+1e-8)
+    return df
+
+fd48=featurize(d48,loo=True); fd49=featurize(d49); ftest=featurize(test)
+LC=[f'gl{o:+d}' for o in [15,-15,30,-30,60,-60,120,-120]]
+FC=['ts_min','hour','tss','tsc','hs','hc','td','lat','lon','re','we','lv','lm','Temperature','NumberofLanes',
+    'geo_mean','geo_std','geo_max','geo_min','geo_ts_mean','geo_hour_mean','hour_mean','hour_std','ts_mean',
+    'road_ts_mean','road_hour_mean','p4_ts_mean','p4_hour_mean','p4_mean','gtr','ghr','gdr','rvh']+LC
+
+gf=fd48[FC].median()
+for df in [fd48,fd49,ftest]:
+    for c in FC: df[c]=df[c].fillna(gf[c])
+
+X48=fd48[FC].values; y48=d48['demand'].values
+X49=fd49[FC].values; y49=d49['demand'].values
+Xt=ftest[FC].values
+vs=sorted(d49['ts_min'].unique())[-3:]
+vm=d49['ts_min'].isin(vs)
+X49tr,X49vl=X49[~vm.values],X49[vm.values]; y49tr,y49vl=y49[~vm.values],y49[vm.values]
+
+D48W,D49W=0.2,10
+Xc=np.vstack([X48,X49tr]); yc=np.concatenate([y48,y49tr])
+wc=np.concatenate([np.ones(len(y48))*D48W,np.ones(len(y49tr))*D49W])
+Xa=np.vstack([X48,X49]); ya=np.concatenate([y48,y49])
+wa=np.concatenate([np.ones(len(y48))*D48W,np.ones(len(y49))*D49W])
+
+print("Training XGB...")
+xp={'objective':'reg:squarederror','max_depth':8,'learning_rate':0.03,'subsample':0.8,'colsample_bytree':0.7,'tree_method':'hist','seed':42,'verbosity':0}
+dtr=xgb.DMatrix(Xc,label=yc,weight=wc); dvl=xgb.DMatrix(X49vl,label=y49vl); dts=xgb.DMatrix(Xt)
+mx=xgb.train(xp,dtr,5000,[(dvl,'val')],early_stopping_rounds=200,verbose_eval=False)
+vx=mx.predict(dvl)
+print(f"XGB val: {max(0,100*r2_score(y49vl,vx)):.4f} iter={mx.best_iteration}")
+dtra=xgb.DMatrix(Xa,label=ya,weight=wa)
+mxf=xgb.train(xp,dtra,mx.best_iteration+100,verbose_eval=False)
+px=mxf.predict(dts)
+np.save('/home/claude/pred_xgb_v5.npy',px); np.save('/home/claude/val_xgb_v5.npy',vx)
+np.save('/home/claude/y49vl_v5.npy',y49vl)
+print(f"XGB done! mean={px.mean():.4f}")
+
+# Now ensemble
+plgb=np.load('/home/claude/pred_lgb_v5.npy')
+vlgb=np.load('/home/claude/val_lgb_v5.npy')
+# CAT timed out on final retrain, use LGB+XGB
+sc_lgb=max(0,100*r2_score(y49vl,vlgb))
+sc_xgb=max(0,100*r2_score(y49vl,vx))
+print(f"\nLGB val: {sc_lgb:.4f}, XGB val: {sc_xgb:.4f}")
+w_lgb=sc_lgb/(sc_lgb+sc_xgb); w_xgb=sc_xgb/(sc_lgb+sc_xgb)
+final=np.clip(w_lgb*plgb+w_xgb*px,0,1)
+blend_val=w_lgb*vlgb+w_xgb*vx
+print(f"Blend val: {max(0,100*r2_score(y49vl,blend_val)):.4f}")
+sub=pd.DataFrame({'Index':test['Index'],'demand':final})
+sub.to_csv('/mnt/user-data/outputs/submission_v5.csv',index=False)
+print(f"Saved! mean={final.mean():.4f} std={final.std():.4f}")

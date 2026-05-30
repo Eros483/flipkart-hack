@@ -1,4 +1,4 @@
-*.md
 *.png
 *.pt
 *.csv
+catboost_info/
